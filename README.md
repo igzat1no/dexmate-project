@@ -375,6 +375,8 @@ python -m task_planner.run \
 - **Segmented Point Cloud** — 按物体着色的分割点云
 - **Low-Level Commands** — 输入 instruction 后显示 pick/place 等可执行命令
 
+**Note** 这里我用pca计算了物体的主轴，并且尝试把左右与物体的朝向结合起来，所以这里是放到了右下角。但似乎左右的定义比较模糊，更应该从摄像头观察的角度来定义。这其实更容易实现，不需要做pca计算朝向啥的，直接全用世界系计算就好了。不过我已经把apikey删掉了，就算了。
+
 ### 运行
 
 ```bash
