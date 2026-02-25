@@ -1,0 +1,498 @@
+#!/home/zongtai/miniconda3/envs/cl_cotnav/bin/python
+"""
+Interactive RViz visualization node for the Dexmate system.
+
+On startup:
+  1. Calls /scene_understanding to detect objects.
+  2. Publishes raw image, annotated image, colored point cloud, scene markers.
+
+Then in a loop:
+  3. Reads a language instruction from the terminal.
+  4. Calls /task_plan to get an executable plan.
+  5. Publishes low-level command markers (pick/place) in RViz.
+
+Published topics:
+  /dexmate/raw_image         (sensor_msgs/Image) - raw RGB
+  /dexmate/annotated_image   (sensor_msgs/Image) - detection overlay
+  /dexmate/point_cloud       (sensor_msgs/PointCloud2) - colored segmented cloud
+  /dexmate/scene_markers     (MarkerArray) - object cubes + labels
+  /dexmate/plan_markers      (MarkerArray) - pick/place low-level commands
+
+Usage:
+    ros2 run dexmate_ros interactive_viz --ros-args \\
+        -p rgb_path:=/path/to/rgb.jpg \\
+        -p depth_path:=/path/to/depth.png \\
+        -p api_key:=YOUR_KEY
+"""
+
+import json
+import os
+import sys
+import threading
+
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+from sensor_msgs.msg import Image, PointCloud2, PointField
+
+from dexmate_interfaces.srv import SceneUnderstanding, TaskPlan
+
+# ── colour palette ─────────────────────────────────────────────────────
+OBJECT_COLORS = [
+    (0.26, 0.52, 0.96),  # blue
+    (0.96, 0.26, 0.21),  # red
+    (0.30, 0.69, 0.31),  # green
+    (1.00, 0.60, 0.00),  # orange
+    (0.61, 0.15, 0.69),  # purple
+    (0.00, 0.74, 0.83),  # cyan
+    (1.00, 0.92, 0.23),  # yellow
+    (0.47, 0.33, 0.28),  # brown
+]
+
+PICK_COLOR = (0.30, 0.69, 0.31, 0.9)   # green
+PLACE_COLOR = (0.96, 0.26, 0.21, 0.9)  # red
+ARROW_COLOR = (1.00, 0.60, 0.00, 0.9)  # orange
+FRAME_ID = "dexmate"
+
+
+def _rgba(r, g, b, a=0.7):
+    c = ColorRGBA()
+    c.r, c.g, c.b, c.a = float(r), float(g), float(b), float(a)
+    return c
+
+
+def _point(x, y, z):
+    p = Point()
+    p.x, p.y, p.z = float(x), float(y), float(z)
+    return p
+
+
+class InteractiveViz(Node):
+    def __init__(self):
+        super().__init__("interactive_viz")
+
+        self.declare_parameter("rgb_path", "")
+        self.declare_parameter("depth_path", "")
+        self.declare_parameter("api_key", "")
+
+        self.raw_image_pub = self.create_publisher(Image, "/dexmate/raw_image", 10)
+        self.annotated_image_pub = self.create_publisher(Image, "/dexmate/annotated_image", 10)
+        self.point_cloud_pub = self.create_publisher(PointCloud2, "/dexmate/point_cloud", 10)
+        self.scene_pub = self.create_publisher(MarkerArray, "/dexmate/scene_markers", 10)
+        self.plan_pub = self.create_publisher(MarkerArray, "/dexmate/plan_markers", 10)
+
+        self.scene_cli = self.create_client(SceneUnderstanding, "scene_understanding")
+        self.plan_cli = self.create_client(TaskPlan, "task_plan")
+
+        self.scene_json_str = "[]"
+        self.scene_objs = []
+        self._raw_image_msg = None
+        self._annotated_image_msg = None
+        self._point_cloud_msg = None
+
+        self._scene_timer = self.create_timer(1.0, self._republish_scene)
+        self._plan_markers = MarkerArray()
+        self._plan_timer = self.create_timer(1.0, self._republish_plan)
+        self._viz_timer = self.create_timer(1.0, self._republish_images_and_cloud)
+
+    def _republish_scene(self):
+        """Periodically republish so RViz picks up markers on late subscription."""
+        if self.scene_objs:
+            markers = self._build_scene_markers(self.scene_objs)
+            self.scene_pub.publish(markers)
+
+    def _republish_plan(self):
+        if self._plan_markers.markers:
+            self.plan_pub.publish(self._plan_markers)
+
+    def _republish_images_and_cloud(self):
+        if self._raw_image_msg:
+            self.raw_image_pub.publish(self._raw_image_msg)
+        if self._annotated_image_msg:
+            self.annotated_image_pub.publish(self._annotated_image_msg)
+        if self._point_cloud_msg:
+            self.point_cloud_pub.publish(self._point_cloud_msg)
+
+    def _cv2_to_ros_image(self, cv_img, frame_id="dexmate"):
+        msg = Image()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.height, msg.width = cv_img.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = msg.width * 3
+        msg.data = cv_img.tobytes()
+        return msg
+
+    def _load_ply_to_pointcloud2(self, ply_path, frame_id="dexmate"):
+        try:
+            import open3d as o3d
+        except ImportError:
+            self.get_logger().warn("open3d not installed, skipping point cloud")
+            return None
+        if not os.path.isfile(ply_path):
+            return None
+        pcd = o3d.io.read_point_cloud(ply_path)
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        colors = np.asarray(pcd.colors)
+        if len(pts) == 0:
+            return None
+        if colors.size == 0:
+            colors = np.ones((len(pts), 3), dtype=np.float32) * 0.5
+        r = (colors[:, 0] * 255).astype(np.uint8)
+        g = (colors[:, 1] * 255).astype(np.uint8)
+        b = (colors[:, 2] * 255).astype(np.uint8)
+        rgb_packed = (r.astype(np.uint32) << 16) | (g.astype(np.uint32) << 8) | b.astype(np.uint32)
+        rgb_float = rgb_packed.view(np.float32)
+        msg = PointCloud2()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.height = 1
+        msg.width = len(pts)
+        msg.is_dense = True
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.point_step = 16
+        msg.row_step = 16 * len(pts)
+        data = np.column_stack([pts[:, 0], pts[:, 1], pts[:, 2], rgb_float]).astype(np.float32)
+        msg.data = data.tobytes()
+        return msg
+
+    # ── scene markers ──────────────────────────────────────────────────
+    def _build_scene_markers(self, objs):
+        ma = MarkerArray()
+        now = self.get_clock().now().to_msg()
+
+        for i, obj in enumerate(objs):
+            c = obj["centroid_xyz"]
+            size = obj.get("size_xyz", [0.05, 0.05, 0.05])
+            color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
+
+            # wireframe cube for the object
+            cube = Marker()
+            cube.header.stamp = now
+            cube.header.frame_id = FRAME_ID
+            cube.ns = "objects"
+            cube.id = i * 2
+            cube.type = Marker.CUBE
+            cube.action = Marker.ADD
+            cube.pose.position = _point(c[0], c[1], c[2])
+            cube.pose.orientation.w = 1.0
+            cube.scale.x = max(size[0], 0.01)
+            cube.scale.y = max(size[1], 0.01)
+            cube.scale.z = max(size[2], 0.01)
+            cube.color = _rgba(*color, 0.35)
+            cube.lifetime.sec = 0
+            ma.markers.append(cube)
+
+            # label above the cube
+            label = Marker()
+            label.header.stamp = now
+            label.header.frame_id = FRAME_ID
+            label.ns = "labels"
+            label.id = i * 2 + 1
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position = _point(c[0], c[1], c[2] - size[2] / 2 - 0.03)
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.025
+            label.color = _rgba(*color, 1.0)
+            label.text = f"{obj['label']} ({obj.get('confidence', 0):.2f})"
+            label.lifetime.sec = 0
+            ma.markers.append(label)
+
+        return ma
+
+    # ── plan markers ───────────────────────────────────────────────────
+    def _build_plan_markers(self, plan):
+        ma = MarkerArray()
+        now = self.get_clock().now().to_msg()
+
+        # clear previous plan markers
+        clear = Marker()
+        clear.header.stamp = now
+        clear.header.frame_id = FRAME_ID
+        clear.ns = "plan"
+        clear.action = Marker.DELETEALL
+        ma.markers.append(clear)
+
+        step_id = 100
+        prev_pos = None
+
+        for step in plan:
+            action = step.get("action")
+            pos = step.get("position")
+
+            if action == "done" or pos is None:
+                continue
+
+            # action sphere
+            sphere = Marker()
+            sphere.header.stamp = now
+            sphere.header.frame_id = FRAME_ID
+            sphere.ns = "plan"
+            sphere.id = step_id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position = _point(*pos)
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.03
+
+            if action == "pick":
+                sphere.color = _rgba(*PICK_COLOR)
+            else:
+                sphere.color = _rgba(*PLACE_COLOR)
+
+            sphere.lifetime.sec = 0
+            ma.markers.append(sphere)
+            step_id += 1
+
+            # label for the step
+            label = Marker()
+            label.header.stamp = now
+            label.header.frame_id = FRAME_ID
+            label.ns = "plan"
+            label.id = step_id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position = _point(pos[0], pos[1], pos[2] - 0.05)
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.02
+
+            if action in ("pick", "pick up"):
+                label.color = _rgba(*PICK_COLOR)
+                label.text = f"PICK {step.get('target', step.get('object_id_1', ''))}"
+            else:
+                rel = step.get("relation", "")
+                ref = step.get("reference", "")
+                label.color = _rgba(*PLACE_COLOR)
+                label.text = f"PLACE {step.get('target', '')} {rel} {ref}"
+
+            label.lifetime.sec = 0
+            ma.markers.append(label)
+            step_id += 1
+
+            # arrow from previous position to this position
+            if prev_pos is not None:
+                arrow = Marker()
+                arrow.header.stamp = now
+                arrow.header.frame_id = FRAME_ID
+                arrow.ns = "plan"
+                arrow.id = step_id
+                arrow.type = Marker.ARROW
+                arrow.action = Marker.ADD
+                arrow.points = [_point(*prev_pos), _point(*pos)]
+                arrow.scale.x = 0.008  # shaft diameter
+                arrow.scale.y = 0.015  # head diameter
+                arrow.scale.z = 0.0
+                arrow.color = _rgba(*ARROW_COLOR)
+                arrow.lifetime.sec = 0
+                ma.markers.append(arrow)
+                step_id += 1
+
+            prev_pos = pos
+
+        return ma
+
+    # ── service calls ──────────────────────────────────────────────────
+    def call_scene_understanding(self):
+        rgb_path = self.get_parameter("rgb_path").value
+        depth_path = self.get_parameter("depth_path").value
+
+        if not rgb_path or not depth_path:
+            self.get_logger().error("rgb_path and depth_path are required.")
+            return False
+
+        self.get_logger().info("Waiting for /scene_understanding service ...")
+        if not self.scene_cli.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error("/scene_understanding not available.")
+            return False
+
+        req = SceneUnderstanding.Request()
+        req.rgb_path = rgb_path
+        req.depth_path = depth_path
+
+        self.get_logger().info("Calling /scene_understanding ...")
+        future = self.scene_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=120.0)
+
+        resp = future.result()
+        if resp is None or not resp.success:
+            msg = resp.message if resp else "timeout"
+            self.get_logger().error(f"Scene understanding failed: {msg}")
+            return False
+
+        self.scene_json_str = resp.scene_json
+        self.scene_objs = json.loads(resp.scene_json)
+        self.get_logger().info(f"Detected {len(self.scene_objs)} objects.")
+
+        markers = self._build_scene_markers(self.scene_objs)
+        self.scene_pub.publish(markers)
+
+        # Load and publish raw image, annotated image, point cloud
+        raw_path = resp.raw_image_path or rgb_path
+        if raw_path and os.path.isfile(raw_path):
+            raw_img = cv2.imread(raw_path, cv2.IMREAD_COLOR)
+            if raw_img is not None:
+                self._raw_image_msg = self._cv2_to_ros_image(raw_img)
+                self.raw_image_pub.publish(self._raw_image_msg)
+                self.get_logger().info(f"Published raw image from {raw_path}")
+        else:
+            self._raw_image_msg = None
+
+        ann_path = resp.annotated_image_path
+        if ann_path and os.path.isfile(ann_path):
+            ann_img = cv2.imread(ann_path, cv2.IMREAD_COLOR)
+            if ann_img is not None:
+                self._annotated_image_msg = self._cv2_to_ros_image(ann_img)
+                self.annotated_image_pub.publish(self._annotated_image_msg)
+                self.get_logger().info(f"Published annotated image from {ann_path}")
+        else:
+            self._annotated_image_msg = None
+
+        ply_path = resp.point_cloud_path
+        if ply_path and os.path.isfile(ply_path):
+            pc_msg = self._load_ply_to_pointcloud2(ply_path)
+            if pc_msg is not None:
+                self._point_cloud_msg = pc_msg
+                self.point_cloud_pub.publish(self._point_cloud_msg)
+                self.get_logger().info(f"Published point cloud from {ply_path}")
+        else:
+            self._point_cloud_msg = None
+
+        return True
+
+    def call_task_plan(self, instruction):
+        api_key = self.get_parameter("api_key").value
+        if not api_key:
+            self.get_logger().error("api_key parameter is required.")
+            return None
+
+        if not self.plan_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("/task_plan not available.")
+            return None
+
+        req = TaskPlan.Request()
+        req.scene_json = self.scene_json_str
+        req.instruction = instruction
+        req.api_key = api_key
+
+        self.get_logger().info(f'Calling /task_plan: "{instruction}"')
+        future = self.plan_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=60.0)
+
+        resp = future.result()
+        if resp is None or not resp.success:
+            msg = resp.message if resp else "timeout"
+            self.get_logger().error(f"Task planning failed: {msg}")
+            return None
+
+        return resp
+
+    # ── interactive loop (runs in a separate thread) ───────────────────
+    def interactive_loop(self):
+        print("\n" + "=" * 60)
+        print(" Dexmate Interactive Planner")
+        print("=" * 60)
+
+        # 1. Scene understanding
+        print("\n[1/2] Running scene understanding ...")
+        ok = self.call_scene_understanding()
+        if not ok:
+            print("Scene understanding failed. Exiting.")
+            rclpy.shutdown()
+            return
+
+        print(f"\nDetected {len(self.scene_objs)} objects:")
+        for obj in self.scene_objs:
+            size = obj.get("size_xyz")
+            sz = f"[{size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f}]" if size else "N/A"
+            print(f"  - {obj['label']:20s}  pos={obj['centroid_xyz']}  size={sz}")
+
+        print("\nScene published to RViz (/dexmate/scene_markers).")
+        print("-" * 60)
+
+        # 2. Interactive instruction loop
+        while rclpy.ok():
+            print()
+            try:
+                instruction = input("Enter instruction (or 'quit'): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting.")
+                break
+
+            if not instruction or instruction.lower() in ("quit", "exit", "q"):
+                print("Bye!")
+                break
+
+            if instruction.lower() == "rescan":
+                print("Re-running scene understanding ...")
+                self.call_scene_understanding()
+                for obj in self.scene_objs:
+                    print(f"  - {obj['label']}")
+                continue
+
+            resp = self.call_task_plan(instruction)
+            if resp is None:
+                continue
+
+            print(f"\nReasoning: {resp.reasoning}")
+
+            print("\nSemantic Plan:")
+            semantic = json.loads(resp.semantic_plan_json)
+            for i, s in enumerate(semantic):
+                print(f"  {i+1}. {s}")
+
+            print("\nExecutable Plan (low-level commands):")
+            executable = json.loads(resp.executable_plan_json)
+            id_to_label = {obj["object_id"]: obj["label"] for obj in self.scene_objs}
+            for i, s in enumerate(executable):
+                act = s.get("action")
+                if act == "done":
+                    print(f"  {i+1}. DONE")
+                elif act in ("pick", "pick up"):
+                    lbl = id_to_label.get(s.get("object_id_1"), "?")
+                    print(f"  {i+1}. PICK  {lbl:15s}  → {s.get('position', [])}")
+                elif act == "place":
+                    lbl = id_to_label.get(s.get("object_id_1"), "?")
+                    ref = id_to_label.get(s.get("object_id_2"), "?")
+                    rel = s.get("relationship", "")
+                    print(f"  {i+1}. PLACE {lbl:15s} {rel} {ref}  → {s.get('position', [])}")
+
+            # Publish plan markers
+            self._plan_markers = self._build_plan_markers(executable)
+            self.plan_pub.publish(self._plan_markers)
+            print("\nPlan published to RViz (/dexmate/plan_markers).")
+
+        rclpy.shutdown()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = InteractiveViz()
+
+    # Run the interactive loop in a background thread so rclpy.spin_until_future_complete works
+    input_thread = threading.Thread(target=node.interactive_loop, daemon=True)
+    input_thread.start()
+
+    # Keep the node alive for timer callbacks (republish markers)
+    try:
+        input_thread.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+# Request: scene JSON + natural-language instruction
+string scene_json
+string instruction
+string api_key
+---
+# Response: semantic + executable plans as JSON strings
+string semantic_plan_json
+string executable_plan_json
+string reasoning
+bool success
+string message

@@ -1,0 +1,54 @@
+{
+  "instruction": "Put the can to the right of the bowl.",
+  "reasoning": "The instruction is to 'Put the can to the right of the bowl'. I will identify the 'potted meat can' (object_id=4) and the 'bowl' (object_id=2). First, I will pick up the 'potted meat can'. Then, I will place it to the right of the 'bowl'. Finally, I will mark the task as done.",
+  "semantic_plan": [
+    {
+      "action": "pick up",
+      "object_id_1": 4
+    },
+    {
+      "action": "place",
+      "object_id_1": 4,
+      "object_id_2": 2,
+      "relationship": "right_of"
+    },
+    {
+      "action": "done"
+    }
+  ],
+  "executable_plan": [
+    {
+      "action": "pick up",
+      "object_id_1": 4,
+      "position": [
+        -0.18739,
+        -0.01535,
+        0.68669
+      ]
+    },
+    {
+      "action": "place",
+      "object_id_1": 4,
+      "object_id_2": 2,
+      "position": [
+        0.05287,
+        -0.10541,
+        0.73597
+      ],
+      "relationship": "right_of"
+    },
+    {
+      "action": "done"
+    }
+  ],
+  "semantic_validation": {
+    "valid": true,
+    "errors": [],
+    "warnings": []
+  },
+  "resolved_validation": {
+    "valid": true,
+    "errors": [],
+    "warnings": []
+  }
+}

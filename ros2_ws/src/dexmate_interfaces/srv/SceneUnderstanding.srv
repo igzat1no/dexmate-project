@@ -1,0 +1,11 @@
+# Request: paths to an RGB-D pair
+string rgb_path
+string depth_path
+---
+# Response: scene description as JSON string + paths for visualization
+string scene_json
+string raw_image_path
+string annotated_image_path
+string point_cloud_path
+bool success
+string message

@@ -1,0 +1,97 @@
+#!/home/zongtai/miniconda3/envs/cl_cotnav/bin/python
+"""
+ROS 2 service node for Task Planner (Task 2.2).
+
+Uses system Python 3.12 for rclpy, delegates VLM planning
+to conda Python via subprocess (planner_worker.py).
+"""
+
+import json
+import os
+import subprocess
+
+import rclpy
+from rclpy.node import Node
+
+from dexmate_interfaces.srv import TaskPlan
+
+_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workers", "planner_worker.py")
+
+
+class TaskPlannerNode(Node):
+    def __init__(self):
+        super().__init__("task_planner_node")
+
+        self.declare_parameter("model", "gemini-2.5-flash")
+        self.declare_parameter("default_api_key", "")
+
+        self.model = self.get_parameter("model").value
+        self.default_api_key = self.get_parameter("default_api_key").value
+
+        self.srv = self.create_service(TaskPlan, "task_plan", self.handle_request)
+        self.get_logger().info(f"Service /task_plan is up  (model={self.model}).")
+
+    def handle_request(self, request, response):
+        instruction = request.instruction
+        api_key = request.api_key or self.default_api_key
+        self.get_logger().info(f'Request: "{instruction}"')
+
+        if not api_key:
+            response.success = False
+            response.message = "No API key provided."
+            return response
+
+        worker_input = json.dumps({
+            "scene_json": json.loads(request.scene_json),
+            "instruction": instruction,
+            "api_key": api_key,
+            "model": self.model,
+        })
+
+        try:
+            proc = subprocess.run(
+                [_WORKER],
+                input=worker_input, capture_output=True, text=True, timeout=60,
+            )
+
+            if proc.returncode != 0:
+                response.success = False
+                response.message = proc.stderr.strip() or "Worker failed"
+                return response
+
+            result = json.loads(proc.stdout)
+            response.success = result.get("success", False)
+            response.message = result.get("message", "")
+            response.semantic_plan_json = json.dumps(
+                result.get("semantic_plan", []), indent=2
+            )
+            response.executable_plan_json = json.dumps(
+                result.get("executable_plan", []), indent=2
+            )
+            response.reasoning = result.get("reasoning", "")
+            self.get_logger().info(response.message)
+
+        except subprocess.TimeoutExpired:
+            response.success = False
+            response.message = "Planner worker timed out (60s)"
+        except Exception as e:
+            response.success = False
+            response.message = str(e)
+
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TaskPlannerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
