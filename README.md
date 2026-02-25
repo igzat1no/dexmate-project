@@ -389,7 +389,7 @@ ros2 launch dexmate_ros dexmate_viz.launch.py default_api_key:=YOUR_GEMINI_KEY
 ros2 run dexmate_ros interactive_viz --ros-args \
     -p rgb_path:=/home/zongtai/Project/Data/YCB-M/realsense_r200/005_006_008_009_011_024/snapshots/000003.jpg \
     -p depth_path:=/home/zongtai/Project/Data/YCB-M/realsense_r200/005_006_008_009_011_024/snapshots/000003.depth.png \
-    -p api_key:=AIzaSyARFYS6cOY6sBWJmQ5BIK0HLHKDXz0IH3c
+    -p api_key:=YOUR_GEMINI_KEY
 ```
 
 启动后：
